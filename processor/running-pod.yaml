@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: shell-geodata
+spec:
+  volumes:
+    - name: pv-wadtiles
+      persistentVolumeClaim:
+        claimName: pvc-wadtiles
+  containers:
+    - name: geodata-running
+      image: nginx
+      volumeMounts:
+        - name: pv-wadtiles
+          mountPath: /mapdata
+      env:
+        - name: OSSDELTARES_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: oss-deltares-creds
+              key: username
+        - name: OSSDELTARES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: oss-deltares-creds
+              key: password

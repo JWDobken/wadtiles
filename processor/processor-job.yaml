@@ -1,0 +1,407 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: processor-scripts
+data:
+  mapnik_template.xml: |
+    <Map srs="+init=epsg:3857">
+      <Style name="color relief style">
+        <Rule>
+          <RasterSymbolizer mode="normal" />
+        </Rule>
+      </Style>
+      <Style name="hillshade style">
+        <Rule>
+          <RasterSymbolizer opacity="0.4" mode="multiply" />
+        </Rule>
+      </Style>
+      <Layer name="color relief">
+        <StyleName>color relief style</StyleName>
+        <Datasource>
+          <Parameter name="type">gdal</Parameter>
+          <Parameter name="file">/mapdata/tif/<YEAR>_color.tif</Parameter>
+        </Datasource>
+      </Layer>
+      <Layer name="hillshade">
+        <StyleName>hillshade style</StyleName>
+        <Datasource>
+          <Parameter name="type">gdal</Parameter>
+          <Parameter name="file">/mapdata/tif/<YEAR>_slopeshade_final.tif</Parameter>
+        </Datasource>
+      </Layer>
+    </Map>
+  color-slope.txt: |
+    0 255 255 255
+    90 0 0 0
+  color-relief.txt: |
+    70 0 55 28 255
+    50 0 127 64 255
+    40 46 100 47 255
+    30 141 49 28 255
+    20 167 122 45 255
+    10 228 122 41 255
+    0 246 168 59 255
+    -10 237 237 135 255
+    -20 182 220 184 255
+    -30 155 215 196 255
+    -50 135 210 215 255
+    -70 108 211 245 255
+    -90 96 164 216 255
+    -120 68 139 201 255
+    -160 65 140 205 255
+    -200 56 115 186 255
+    -250 45 98 197 255
+    -300 44 99 176 255
+    -350 5 87 175 255
+    -400 22 72 153 255
+    -500 30 34 105 255
+    -8000 32 4 74 255
+    -8001 0 0 0 0
+  svn_checkout.sh: |
+    mkdir -p /mapdata/asc/$YEAR
+    SVNSTATUS=$(svn checkout --non-interactive $BASE_URL/$YEAR --username $OSSDELTARES_USERNAME --password=$OSSDELTARES_PASSWORD /mapdata/asc/$YEAR/)
+    echo $SVNSTATUS
+  asc_to_tif.sh: |
+    rm -rf /mapdata/tif/$YEAR**
+    mkdir -p /mapdata/tif/$YEAR
+    for file in /mapdata/asc/$YEAR/**.{asc,ASC};
+    do
+      filename="$(basename $file)"
+      tempfile="/tmp/${filename/.[Aa][Ss][Cc]/.tif}"
+      targetfile="/mapdata/tif/$YEAR/${filename/.[Aa][Ss][Cc]/.tif}"
+      # CONVERT ASC TO TIF
+      gdal_translate -of "GTIFF" -co "COMPRESS=NONE" -co "TILED=YES" $file $tempfile
+      gdalwarp $tempfile $targetfile -s_srs EPSG:28992 -t_srs EPSG:3857 -r bilinear
+    done
+    # Merge the tiles together into a Virtual Format: https://gdal.org/drivers/raster/vrt.html
+    gdalbuildvrt /mapdata/tif/$YEAR.vrt /mapdata/tif/$YEAR/*.tif
+    # Generate the hillshade from the merged DEM
+    gdaldem color-relief -of GTiff /mapdata/tif/$YEAR.vrt /src/color-relief.txt /mapdata/tif/${YEAR}_color.tif -alpha
+    gdaldem slope /mapdata/tif/$YEAR.vrt /mapdata/tif/${YEAR}_slope.tif -compute_edges
+    gdaldem color-relief -of GTiff /mapdata/tif/${YEAR}_slope.tif /src/color-slope.txt /mapdata/tif/${YEAR}_slopeshade.tif
+    gdal_calc.py -A /mapdata/tif/${YEAR}_slopeshade.tif --outfile=/mapdata/tif/${YEAR}_slopeshade_final.tif --calc="A"
+  generate_tiles.py: |
+    #!/usr/bin/env python
+    from math import pi, cos, sin, log, exp, atan
+    from subprocess import call
+    import sys
+    import os
+    from Queue import Queue
+    import gdal
+    from gdalconst import GA_ReadOnly
+
+    import threading
+
+    try:
+        import mapnik2 as mapnik
+    except:
+        import mapnik
+
+    DEG_TO_RAD = pi/180
+    RAD_TO_DEG = 180/pi
+
+    # Default number of rendering threads to spawn, should be roughly equal to number of CPU cores available
+    NUM_THREADS = 4
+
+
+    def get_bbox(tiffile):
+        data = gdal.Open(tiffile, GA_ReadOnly)
+        geoTransform = data.GetGeoTransform()
+        minx = geoTransform[0]
+        maxy = geoTransform[3]
+        maxx = minx + geoTransform[1] * data.RasterXSize
+        miny = maxy + geoTransform[5] * data.RasterYSize
+        return (minx, miny, maxx, maxy)
+
+
+    def minmax(a, b, c):
+        a = max(a, b)
+        a = min(a, c)
+        return a
+
+
+    class GoogleProjection:
+        def __init__(self, levels=18):
+            self.Bc = []
+            self.Cc = []
+            self.zc = []
+            self.Ac = []
+            c = 256
+            for d in range(0, levels):
+                e = c/2
+                self.Bc.append(c/360.0)
+                self.Cc.append(c/(2 * pi))
+                self.zc.append((e, e))
+                self.Ac.append(c)
+                c *= 2
+
+        def fromLLtoPixel(self, ll, zoom):
+            d = self.zc[zoom]
+            e = round(d[0] + ll[0] * self.Bc[zoom])
+            f = minmax(sin(DEG_TO_RAD * ll[1]), -0.9999, 0.9999)
+            g = round(d[1] + 0.5*log((1+f)/(1-f))*-self.Cc[zoom])
+            return (e, g)
+
+        def fromPixelToLL(self, px, zoom):
+            e = self.zc[zoom]
+            f = (px[0] - e[0])/self.Bc[zoom]
+            g = (px[1] - e[1])/-self.Cc[zoom]
+            h = RAD_TO_DEG * (2 * atan(exp(g)) - 0.5 * pi)
+            return (f, h)
+
+
+    class RenderThread:
+        def __init__(self, tile_dir, mapfile, q, printLock, maxZoom):
+            self.tile_dir = tile_dir
+            self.q = q
+            self.m = mapnik.Map(256, 256)
+            self.printLock = printLock
+            # Load style XML
+            mapnik.load_map(self.m, mapfile, True)
+            # Obtain <Map> projection
+            self.prj = mapnik.Projection(self.m.srs)
+            # Projects between tile pixel co-ordinates and LatLong (EPSG:4326)
+            self.tileproj = GoogleProjection(maxZoom+1)
+
+        def render_tile(self, tile_uri, x, y, z):
+
+            # Calculate pixel positions of bottom-left & top-right
+            p0 = (x * 256, (y + 1) * 256)
+            p1 = ((x + 1) * 256, y * 256)
+
+            # Convert to LatLong (EPSG:4326)
+            l0 = self.tileproj.fromPixelToLL(p0, z)
+            l1 = self.tileproj.fromPixelToLL(p1, z)
+
+            # Convert to map projection (e.g. mercator co-ords EPSG:900913)
+            c0 = self.prj.forward(mapnik.Coord(l0[0], l0[1]))
+            c1 = self.prj.forward(mapnik.Coord(l1[0], l1[1]))
+
+            # Bounding box for the tile
+            if hasattr(mapnik, 'mapnik_version') and mapnik.mapnik_version() >= 800:
+                bbox = mapnik.Box2d(c0.x, c0.y, c1.x, c1.y)
+            else:
+                bbox = mapnik.Envelope(c0.x, c0.y, c1.x, c1.y)
+            render_size = 256
+            self.m.resize(render_size, render_size)
+            self.m.zoom_to_box(bbox)
+            if(self.m.buffer_size < 128):
+                self.m.buffer_size = 128
+
+            # Render image with default Agg renderer
+            im = mapnik.Image(render_size, render_size)
+            mapnik.render(self.m, im)
+            im.save(tile_uri, 'png256')
+
+        def loop(self):
+            while True:
+                # Fetch a tile from the queue and render it
+                r = self.q.get()
+                if (r == None):
+                    self.q.task_done()
+                    break
+                else:
+                    (name, tile_uri, x, y, z) = r
+
+                exists = ""
+                if os.path.isfile(tile_uri):
+                    exists = "exists"
+                else:
+                    self.render_tile(tile_uri, x, y, z)
+                bytes = os.stat(tile_uri)[6]
+                empty = ''
+                if bytes == 116:
+                    empty = " Empty Tile "
+                    os.remove(tile_uri)
+                self.printLock.acquire()
+                # print name, ":", z, x, y, exists, empty
+                self.printLock.release()
+                self.q.task_done()
+
+
+    def render_tiles(bbox, mapfile, tile_dir, minZoom=1, maxZoom=18, name="unknown", num_threads=NUM_THREADS, tms_scheme=False):
+        print "render_tiles(", bbox, mapfile, tile_dir, minZoom, maxZoom, name, ")"
+
+        # Launch rendering threads
+        queue = Queue(32)
+        printLock = threading.Lock()
+        renderers = {}
+        for i in range(num_threads):
+            renderer = RenderThread(tile_dir, mapfile, queue, printLock, maxZoom)
+            render_thread = threading.Thread(target=renderer.loop)
+            render_thread.start()
+            # print "Started render thread %s" % render_thread.getName()
+            renderers[i] = render_thread
+
+        if not os.path.isdir(tile_dir):
+            os.mkdir(tile_dir)
+
+        gprj = GoogleProjection(maxZoom+1)
+
+        ll0 = (bbox[0], bbox[3])
+        ll1 = (bbox[2], bbox[1])
+
+        for z in range(minZoom, maxZoom + 1):
+            px0 = gprj.fromLLtoPixel(ll0, z)
+            px1 = gprj.fromLLtoPixel(ll1, z)
+
+            # check if we have directories in place
+            zoom = "%s" % z
+            if not os.path.isdir(tile_dir + zoom):
+                os.mkdir(tile_dir + zoom)
+            for x in range(int(px0[0]/256.0), int(px1[0]/256.0)+1):
+                # Validate x co-ordinate
+                if (x < 0) or (x >= 2**z):
+                    continue
+                # check if we have directories in place
+                str_x = "%s" % x
+                if not os.path.isdir(tile_dir + zoom + '/' + str_x):
+                    os.mkdir(tile_dir + zoom + '/' + str_x)
+                for y in range(int(px0[1]/256.0), int(px1[1]/256.0)+1):
+                    # Validate x co-ordinate
+                    if (y < 0) or (y >= 2**z):
+                        continue
+                    # flip y to match OSGEO TMS spec
+                    if tms_scheme:
+                        str_y = "%s" % ((2**z-1) - y)
+                    else:
+                        str_y = "%s" % y
+                    tile_uri = tile_dir + zoom + '/' + str_x + '/' + str_y + '.png'
+                    # Submit tile to be rendered into the queue
+                    t = (name, tile_uri, x, y, z)
+                    try:
+                        queue.put(t)
+                    except KeyboardInterrupt:
+                        raise SystemExit("Ctrl-c detected, exiting...")
+
+        # Signal render threads to exit by sending empty request to queue
+        for i in range(num_threads):
+            queue.put(None)
+        # wait for pending rendering jobs to complete
+        queue.join()
+        for i in range(num_threads):
+            renderers[i].join()
+
+
+    if __name__ == "__main__":
+        home = os.environ['HOME']
+        try:
+            mapfile = os.environ['MAPNIK_MAP_FILE']
+        except KeyError:
+            mapfile = home + "/svn.openstreetmap.org/applications/rendering/mapnik/osm-local.xml"
+        try:
+            tile_dir = os.environ['MAPNIK_TILE_DIR']
+        except KeyError:
+            tile_dir = home + "/osm/tiles/"
+
+        if not tile_dir.endswith('/'):
+            tile_dir = tile_dir + '/'
+
+        # -------------------------------------------------------------------------
+        #
+        # Change the following for different bounding boxes and zoom levels
+        #
+        # Start with an overview
+        # World
+        bbox = (-180.0, -90.0, 180.0, 90.0)
+
+        render_tiles(bbox, mapfile, tile_dir, 0, 5, "World")
+
+        minZoom = 10
+        maxZoom = 16
+        bbox = (-2, 50.0, 1.0, 52.0)
+        render_tiles(bbox, mapfile, tile_dir, minZoom, maxZoom)
+
+        # Muenchen
+        bbox = (11.4, 48.07, 11.7, 48.22)
+        render_tiles(bbox, mapfile, tile_dir, 1, 12, "Muenchen")
+
+        # Muenchen+
+        bbox = (11.3, 48.01, 12.15, 48.44)
+        render_tiles(bbox, mapfile, tile_dir, 7, 12, "Muenchen+")
+
+        # Muenchen++
+        bbox = (10.92, 47.7, 12.24, 48.61)
+        render_tiles(bbox, mapfile, tile_dir, 7, 12, "Muenchen++")
+
+        # Nuernberg
+        bbox = (10.903198, 49.560441, 49.633534, 11.038085)
+        render_tiles(bbox, mapfile, tile_dir, 10, 16, "Nuernberg")
+
+        # Karlsruhe
+        bbox = (8.179113, 48.933617, 8.489252, 49.081707)
+        render_tiles(bbox, mapfile, tile_dir, 10, 16, "Karlsruhe")
+
+        # Karlsruhe+
+        bbox = (8.3, 48.95, 8.5, 49.05)
+        render_tiles(bbox, mapfile, tile_dir, 1, 16, "Karlsruhe+")
+
+        # Augsburg
+        bbox = (8.3, 48.95, 8.5, 49.05)
+        render_tiles(bbox, mapfile, tile_dir, 1, 16, "Augsburg")
+
+        # Augsburg+
+        bbox = (10.773251, 48.369594, 10.883834, 48.438577)
+        render_tiles(bbox, mapfile, tile_dir, 10, 14, "Augsburg+")
+
+        # Europe+
+        bbox = (1.0, 10.0, 20.6, 50.0)
+        render_tiles(bbox, mapfile, tile_dir, 1, 11, "Europe+")
+
+  generate_tiles.sh: |
+    pip install mapnik2
+    # make mapnik xml
+    cp /src/mapnik_template.xml /mapdata/tif/${YEAR}.xml
+    sed -i 's/<YEAR>/'"$YEAR"'/g' /mapdata/tif/${YEAR}.xml
+
+    # PNG tiles
+    rm -rf /mapdata/png/$YEAR**
+    mkdir -p /mapdata/png
+    python /src/run_mapnik.py $YEAR $ZOOM
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: wadtiles-processor
+spec:
+  backoffLimit: 4
+  template:
+    spec:
+      volumes:
+        - name: processor-scripts
+          configMap:
+            name: processor-scripts
+            defaultMode: 0777
+        - name: pv-wadtiles
+          persistentVolumeClaim:
+            claimName: pvc-wadtiles
+      containers:
+        - name: geodata
+          image: geodata/gdal:2.1.3
+          # command: ["/bin/sh", "-c", "/src/svn_checkout.sh"]
+          command:
+            - sleep
+            - infinity
+          volumeMounts:
+            - name: pv-wadtiles
+              mountPath: /mapdata
+            - mountPath: /src
+              name: processor-scripts
+          env:
+            - name: YEAR
+              value: "2015"
+            - name: ZOOM
+              value: "8-10"
+            - name: BASE_URL
+              value: "https://svn.oss.deltares.nl/repos/openearthrawdata/trunk/rijkswaterstaat/vaklodingen/raw/grid"
+            - name: OSSDELTARES_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: oss-deltares-creds
+                  key: username
+            - name: OSSDELTARES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: oss-deltares-creds
+                  key: password
+      restartPolicy: Never
